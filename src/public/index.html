@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Geoportal Address and Parcel Search</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel">
+        <h1>Geoportal Address and Parcel Search</h1>
+        <p>Search addresses or cadastre numbers from imported Geoportal open datasets.</p>
+
+        <div class="row">
+          <input id="search" type="text" placeholder="Type address or cadastral number..." />
+        </div>
+
+        <div id="status" class="status">Ready</div>
+        <ul id="results" class="results"></ul>
+
+        <article id="details" class="details hidden">
+          <h2 id="detailsTitle">Details</h2>
+          <p id="detailsMeta"></p>
+          <pre id="detailsJson"></pre>
+        </article>
+      </section>
+
+      <section class="map-wrap">
+        <div id="map"></div>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/proj4@2.12.1/dist/proj4.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

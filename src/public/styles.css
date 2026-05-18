@@ -1,0 +1,142 @@
+:root {
+  --bg: #f5f4ef;
+  --panel: #fffdf8;
+  --ink: #1d241f;
+  --accent: #216869;
+  --accent-2: #49a078;
+  --line: #d8d7cf;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: radial-gradient(circle at top left, #fff, var(--bg));
+}
+
+.layout {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 380px 1fr;
+}
+
+.panel {
+  border-right: 1px solid var(--line);
+  padding: 20px;
+  background: var(--panel);
+  overflow: auto;
+}
+
+.panel h1 {
+  margin: 0 0 8px;
+  font-size: 1.4rem;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+input,
+button {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+input {
+  flex: 1;
+}
+
+button {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #fff;
+  border: 0;
+  cursor: pointer;
+}
+
+.status {
+  font-size: 0.9rem;
+  margin-bottom: 8px;
+}
+
+.results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.results li {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+  cursor: pointer;
+  position: relative;
+}
+
+.results li:hover {
+  border-color: var(--accent);
+}
+
+.result-tag {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 0.72rem;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.details {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.details pre {
+  max-height: 280px;
+  overflow: auto;
+  background: #f0f0eb;
+  padding: 10px;
+  border-radius: 8px;
+}
+
+.hidden {
+  display: none;
+}
+
+.map-wrap {
+  position: relative;
+}
+
+#map {
+  width: 100%;
+  height: 100vh;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 45vh;
+  }
+
+  .panel {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  #map {
+    height: 45vh;
+  }
+}
