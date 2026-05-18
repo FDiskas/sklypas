@@ -1,0 +1,7 @@
+node_modules/
+data/cache/
+data/sync.lock
+data/geoportal.db
+data/geoportal.db-shm
+data/geoportal.db-wal
+.DS_Store
