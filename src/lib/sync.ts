@@ -4,7 +4,7 @@ import { basename, extname, join, dirname } from "path";
 import { $ } from "bun";
 import { settings, paths } from "../config";
 import { fetchOpenDataDocuments, getDownloadUrl, type GeoportalDocument } from "./geoportal";
-import { getSyncState, initDb, openDb, setSyncState, upsertDataset, clearSourceData } from "./db";
+import { getSyncState, initDb, openDb, setSyncState, upsertDataset, clearSourceData, indexGeometryRow } from "./db";
 import { createProgressReporter, type ProgressReporter, logger, stopProgress } from "./progress";
 
 type SourceCandidate = {
@@ -285,7 +285,9 @@ function insertIntoLayerTable(
     ...propertyKeys.map((key) => toSqlValue(properties[key])),
   ];
 
-  db.prepare(sql).run(...values);
+  const result = db.prepare(sql).run(...values);
+  // Keep spatial index (if any) in lockstep with the per-layer table.
+  indexGeometryRow(db, tableName, Number(result.lastInsertRowid), geometryJson);
 }
 
 function looksLikeAddressField(fieldName: string): boolean {

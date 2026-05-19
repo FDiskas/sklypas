@@ -14,6 +14,27 @@ export type SearchResult = {
   info_json: string;
   latitude: number | null;
   longitude: number | null;
+  buildings?: Array<{
+    gml_id: string;
+    geometry_json: string | null;
+    numberOfDwellings: number | null;
+    description: string | null;
+  }>;
+  parcel?: {
+    kadastro_nr: string | null;
+    unikalus_nr: string | null;
+    geometry_json: string | null;
+  };
+};
+
+const BUILDING_TABLE = "layer_3bbd0ff5_4b37_4a12_bfb6_6a058f594d29_building";
+const PARCELS_TABLE = "layer_f5af6623_4b67_4c69_8e44_6bca70d1b91c_parcels_public";
+
+// Source-table name → R-tree virtual-table name. Insert/clear paths in sync.ts read this
+// to keep the spatial index in lockstep with the layer data.
+export const SPATIAL_INDEX_BY_TABLE: Record<string, string> = {
+  [BUILDING_TABLE]: "building_rtree",
+  [PARCELS_TABLE]: "parcels_rtree",
 };
 
 export type ParcelSearchResult = {
@@ -198,6 +219,147 @@ export function initDb(db: Database): void {
     setSyncState(db, "db_migration_v3", "1");
     logger.info("[db] migration v3 complete");
   }
+
+  // R-tree spatial indexes for buildings and parcels. Created unconditionally so the
+  // insert-time hook in sync.ts can always assume the target table exists.
+  for (const rtreeTable of Object.values(SPATIAL_INDEX_BY_TABLE)) {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${rtreeTable} USING rtree(id, min_lat, max_lat, min_lon, max_lon)`);
+  }
+
+  // One-time backfill for databases that already had data when this index was introduced.
+  // No-op on a fresh install (layer tables are empty/missing).
+  if (!getSyncState(db, "db_migration_v4_buildings")) {
+    populateRtreeIndex(db, BUILDING_TABLE, "building_rtree");
+    setSyncState(db, "db_migration_v4_buildings", "1");
+  }
+  if (!getSyncState(db, "db_migration_v4_parcels")) {
+    populateRtreeIndex(db, PARCELS_TABLE, "parcels_rtree");
+    setSyncState(db, "db_migration_v4_parcels", "1");
+  }
+}
+
+/**
+ * Compute bbox from a serialized GeoJSON geometry. Returned tuple is [minLat, maxLat, minLon, maxLon].
+ */
+export function bboxFromGeometryJson(geometryJson: string | null): [number, number, number, number] | null {
+  if (!geometryJson) return null;
+  try {
+    const geom = JSON.parse(geometryJson);
+    return computeBbox(geom?.coordinates);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * If `tableName` has a spatial R-tree index, insert a bbox row pointing at `rowid`.
+ * Safe to call for any table; no-op when there is no associated index.
+ */
+export function indexGeometryRow(db: Database, tableName: string, rowid: number, geometryJson: string | null): void {
+  const rtreeTable = SPATIAL_INDEX_BY_TABLE[tableName];
+  if (!rtreeTable) return;
+  const bbox = bboxFromGeometryJson(geometryJson);
+  if (!bbox) return;
+  db.prepare(`INSERT INTO ${rtreeTable}(id, min_lat, max_lat, min_lon, max_lon) VALUES (?, ?, ?, ?, ?)`)
+    .run(rowid, bbox[0], bbox[1], bbox[2], bbox[3]);
+}
+
+/**
+ * Remove all spatial-index rows belonging to rows in `tableName` with the given `_source_path`.
+ * Must be called BEFORE deleting from the layer table, while the rowids are still resolvable.
+ */
+export function clearSpatialIndexBySourcePath(db: Database, tableName: string, sourcePath: string): void {
+  const rtreeTable = SPATIAL_INDEX_BY_TABLE[tableName];
+  if (!rtreeTable) return;
+  db.prepare(
+    `DELETE FROM ${rtreeTable} WHERE id IN (SELECT rowid FROM ${quoteIdent(tableName)} WHERE _source_path = ?)`
+  ).run(sourcePath);
+}
+
+function computeBbox(coords: unknown): [number, number, number, number] | null {
+  let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+  let hasAny = false;
+
+  const walk = (c: unknown): void => {
+    if (!Array.isArray(c)) return;
+    if (c.length >= 2 && typeof c[0] === "number" && typeof c[1] === "number") {
+      const lon = c[0] as number;
+      const lat = c[1] as number;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+      hasAny = true;
+      return;
+    }
+    for (const part of c) walk(part);
+  };
+
+  walk(coords);
+  return hasAny ? [minLat, maxLat, minLon, maxLon] : null;
+}
+
+function populateRtreeIndex(db: Database, sourceTable: string, rtreeTable: string): void {
+  const exists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(sourceTable);
+  if (!exists) {
+    logger.info(`[db] migration v4: ${sourceTable} not present, skipping ${rtreeTable}`);
+    return;
+  }
+
+  logger.info(`[db] migration v4: building ${rtreeTable} from ${sourceTable} (this may take a minute)...`);
+
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${rtreeTable} USING rtree(id, min_lat, max_lat, min_lon, max_lon)`);
+  db.exec(`DELETE FROM ${rtreeTable}`);
+
+  const insertStmt = db.prepare(`INSERT INTO ${rtreeTable}(id, min_lat, max_lat, min_lon, max_lon) VALUES (?, ?, ?, ?, ?)`);
+  const selectStmt = db.prepare(`SELECT rowid AS rid, _geometry_json AS gj FROM ${quoteIdent(sourceTable)} WHERE _geometry_json IS NOT NULL`);
+
+  let indexed = 0;
+  let scanned = 0;
+  db.transaction(() => {
+    for (const row of selectStmt.iterate() as Iterable<{ rid: number; gj: string }>) {
+      scanned++;
+      try {
+        const geom = JSON.parse(row.gj);
+        const bbox = computeBbox(geom?.coordinates);
+        if (bbox) {
+          insertStmt.run(row.rid, bbox[0], bbox[1], bbox[2], bbox[3]);
+          indexed++;
+        }
+      } catch {
+        // skip malformed JSON
+      }
+    }
+  })();
+
+  logger.info(`[db] migration v4: ${rtreeTable} indexed ${indexed}/${scanned} rows`);
+}
+
+function pointInRing(lat: number, lon: number, ring: number[][]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect = ((yi > lat) !== (yj > lat)) && (lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function pointInGeometry(lat: number, lon: number, geom: { type?: string; coordinates?: number[][][] | number[][][][] } | null): boolean {
+  if (!geom || !geom.coordinates) return false;
+  if (geom.type === "Polygon") {
+    const rings = geom.coordinates as number[][][];
+    if (!rings.length) return false;
+    return pointInRing(lat, lon, rings[0]);
+  }
+  if (geom.type === "MultiPolygon") {
+    const polys = geom.coordinates as number[][][][];
+    for (const poly of polys) {
+      if (poly.length && pointInRing(lat, lon, poly[0])) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -230,12 +392,17 @@ export function clearSourceData(db: Database, datasetUuid: string, sourcePath: s
   }
   db.prepare("DELETE FROM address_index WHERE dataset_uuid = ? AND source_table IN (SELECT table_name FROM imported_layers WHERE dataset_uuid = ? AND source_path = ?)").run(datasetUuid, datasetUuid, sourcePath);
 
-  // Delete from imported_layers
-  db.prepare("DELETE FROM imported_layers WHERE dataset_uuid = ? AND source_path = ?").run(datasetUuid, sourcePath);
-
-  // Delete from all per-layer tables
+  // Capture the layer-table list BEFORE deleting the imported_layers row — otherwise the
+  // SELECT below returns nothing and the per-layer / spatial-index cleanup silently no-ops.
   const layers = db.prepare("SELECT DISTINCT table_name FROM imported_layers WHERE dataset_uuid = ?").all(datasetUuid) as { table_name: string }[];
+
+  // Delete from all per-layer tables (and matching spatial-index rows first).
   for (const { table_name } of layers) {
+    try {
+      clearSpatialIndexBySourcePath(db, table_name, sourcePath);
+    } catch {
+      // Layer table missing — nothing to clean from the spatial index either.
+    }
     const quoted = `"${table_name.replace(/"/g, '""')}"`;
     try {
       db.prepare(`DELETE FROM ${quoted} WHERE _source_path = ?`).run(sourcePath);
@@ -243,6 +410,9 @@ export function clearSourceData(db: Database, datasetUuid: string, sourcePath: s
       // Table might not exist yet, that's ok
     }
   }
+
+  // Finally, drop the imported_layers bookkeeping row.
+  db.prepare("DELETE FROM imported_layers WHERE dataset_uuid = ? AND source_path = ?").run(datasetUuid, sourcePath);
 }
 
 export function upsertDataset(db: Database, doc: GeoportalDocument, downloadUrl: string | null): void {
@@ -325,13 +495,159 @@ export function searchAddresses(db: Database, query: string, limit = 20): Search
   }
 }
 
+type BuildingRow = {
+  gml_id: string;
+  geometry_json: string | null;
+  numberOfDwellings: number | null;
+  description: string | null;
+};
+
+function findBuildingsNearAddress(db: Database, latitude: number, longitude: number): SearchResult["buildings"] {
+  // ~250m search radius at Lithuania latitude.
+  const latPad = 0.0025;
+  const lonPad = 0.004;
+
+  try {
+    const rows = db.prepare(`
+      SELECT b.gml_id, b._geometry_json AS geometry_json, b.numberOfDwellings, b.description
+      FROM building_rtree r
+      JOIN ${quoteIdent(BUILDING_TABLE)} b ON b.rowid = r.id
+      WHERE r.min_lat <= ? AND r.max_lat >= ?
+        AND r.min_lon <= ? AND r.max_lon >= ?
+      LIMIT 50
+    `).all(latitude + latPad, latitude - latPad, longitude + lonPad, longitude - lonPad) as BuildingRow[];
+
+    return rows.length > 0 ? rows : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Find buildings inside the given parcel geometry. Uses the parcel's bbox to prefilter via
+ * R-tree, then keeps only buildings whose centroid actually falls inside the polygon.
+ */
+function findBuildingsInParcel(db: Database, parcelGeometryJson: string): SearchResult["buildings"] {
+  let parcelGeom: { type?: string; coordinates?: number[][][] | number[][][][] };
+  try {
+    parcelGeom = JSON.parse(parcelGeometryJson);
+  } catch {
+    return undefined;
+  }
+  const bbox = computeBbox(parcelGeom?.coordinates);
+  if (!bbox) return undefined;
+  const [minLat, maxLat, minLon, maxLon] = bbox;
+
+  try {
+    const rows = db.prepare(`
+      SELECT b.gml_id, b._geometry_json AS geometry_json, b.numberOfDwellings, b.description
+      FROM building_rtree r
+      JOIN ${quoteIdent(BUILDING_TABLE)} b ON b.rowid = r.id
+      WHERE r.min_lat <= ? AND r.max_lat >= ?
+        AND r.min_lon <= ? AND r.max_lon >= ?
+      LIMIT 500
+    `).all(maxLat, minLat, maxLon, minLon) as BuildingRow[];
+
+    const inside: BuildingRow[] = [];
+    for (const row of rows) {
+      if (!row.geometry_json) continue;
+      try {
+        const bgeom = JSON.parse(row.geometry_json);
+        const c = centroidOfGeometry(bgeom);
+        if (c && pointInGeometry(c.lat, c.lon, parcelGeom)) {
+          inside.push(row);
+        }
+      } catch {
+        // skip malformed JSON
+      }
+    }
+    return inside.length > 0 ? inside : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function centroidOfGeometry(geom: { type?: string; coordinates?: unknown } | null): { lat: number; lon: number } | null {
+  if (!geom) return null;
+  let ring: number[][] | null = null;
+  if (geom.type === "Polygon" && Array.isArray((geom.coordinates as number[][][])?.[0])) {
+    ring = (geom.coordinates as number[][][])[0];
+  } else if (geom.type === "MultiPolygon" && Array.isArray((geom.coordinates as number[][][][])?.[0]?.[0])) {
+    ring = (geom.coordinates as number[][][][])[0][0];
+  }
+  if (!ring || ring.length === 0) return null;
+  let sumLat = 0;
+  let sumLon = 0;
+  for (const [lon, lat] of ring) {
+    sumLon += lon;
+    sumLat += lat;
+  }
+  return { lat: sumLat / ring.length, lon: sumLon / ring.length };
+}
+
+type ParcelLookup = {
+  parcel: NonNullable<SearchResult["parcel"]>;
+  /** True when the address point is actually inside the parcel polygon (not just its bbox). */
+  contains: boolean;
+};
+
+function findParcelContainingAddress(db: Database, latitude: number, longitude: number): ParcelLookup | undefined {
+  try {
+    const rows = db.prepare(`
+      SELECT p.kadastro_nr, p.unikalus_nr, p._geometry_json AS geometry_json
+      FROM parcels_rtree r
+      JOIN ${quoteIdent(PARCELS_TABLE)} p ON p.rowid = r.id
+      WHERE r.min_lat <= ? AND r.max_lat >= ?
+        AND r.min_lon <= ? AND r.max_lon >= ?
+      LIMIT 20
+    `).all(latitude, latitude, longitude, longitude) as Array<{
+      kadastro_nr: string | null;
+      unikalus_nr: string | null;
+      geometry_json: string | null;
+    }>;
+
+    // Refine bbox candidates with a point-in-polygon test to pick the actual containing parcel.
+    for (const row of rows) {
+      if (!row.geometry_json) continue;
+      try {
+        const geom = JSON.parse(row.geometry_json);
+        if (pointInGeometry(latitude, longitude, geom)) {
+          return { parcel: row, contains: true };
+        }
+      } catch {
+        // skip malformed JSON
+      }
+    }
+
+    // No exact containing parcel — fall back to the first bbox candidate so the user still
+    // sees a nearby parcel polygon, but mark it as not actually containing the point.
+    return rows[0] ? { parcel: rows[0], contains: false } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function getAddressById(db: Database, id: number): SearchResult | null {
   const stmt = db.prepare(`
     SELECT id, dataset_uuid, dataset_name, source_table, source_fid, address_text, info_json, latitude, longitude
     FROM address_index
     WHERE id = ?
   `);
-  return (stmt.get(id) as SearchResult | null) ?? null;
+  const result = stmt.get(id) as Omit<SearchResult, "buildings" | "parcel"> | null;
+  if (!result) {
+    return null;
+  }
+
+  if (result.latitude && result.longitude) {
+    const lookup = findParcelContainingAddress(db, result.latitude, result.longitude);
+    (result as SearchResult).parcel = lookup?.parcel;
+    // Restrict buildings to the parcel only when the address point is actually inside it.
+    // Otherwise the parcel is just a nearby fallback, so use the small-radius search instead.
+    (result as SearchResult).buildings = lookup?.contains && lookup.parcel.geometry_json
+      ? findBuildingsInParcel(db, lookup.parcel.geometry_json)
+      : findBuildingsNearAddress(db, result.latitude, result.longitude);
+  }
+  return result as SearchResult;
 }
 
 export function searchParcelsByCadastre(db: Database, query: string, limit = 20): ParcelSearchResult[] {

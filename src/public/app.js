@@ -15,6 +15,7 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 let marker = null;
 let parcelLayer = null;
 let searchTimer = null;
+let buildingLayers = [];
 
 const lks94Def = "+proj=tmerc +lat_0=0 +lon_0=24 +k=0.9998 +x_0=500000 +y_0=0 +ellps=GRS80 +units=m +no_defs";
 if (window.proj4) {
@@ -31,6 +32,12 @@ function clearMapObjects() {
     map.removeLayer(parcelLayer);
     parcelLayer = null;
   }
+
+  // Clear building layers
+  buildingLayers.forEach(layer => {
+    map.removeLayer(layer);
+  });
+  buildingLayers = [];
 }
 
 function looksLikeWgs84Pair(coords) {
@@ -106,6 +113,50 @@ function renderResults(items) {
   }
 }
 
+// Helper to render building polygons
+function renderBuilding(geometry, gmlId, description, dwellings, color) {
+  if (!geometry || !geometry.coordinates) {
+    return null;
+  }
+
+  try {
+    if (geometry.type === "Polygon") {
+      const rings = geometry.coordinates;
+      if (rings.length > 0 && rings[0].length > 0) {
+        const latLngs = rings[0].map(coord => L.latLng(coord[1], coord[0]));
+        const layer = L.polygon(latLngs, {
+          color: color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.25,
+        }).addTo(map);
+        layer.bindPopup(`Building: ${description || gmlId}<br/>Dwellings: ${dwellings || "?"}`);
+        return layer;
+      }
+    } else if (geometry.type === "MultiPolygon") {
+      const polygons = geometry.coordinates;
+      let layers = [];
+      for (const rings of polygons) {
+        if (rings.length > 0 && rings[0].length > 0) {
+          const latLngs = rings[0].map(coord => L.latLng(coord[1], coord[0]));
+          const layer = L.polygon(latLngs, {
+            color: color,
+            weight: 2,
+            fillColor: color,
+            fillOpacity: 0.25,
+          }).addTo(map);
+          layer.bindPopup(`Building: ${description || gmlId}<br/>Dwellings: ${dwellings || "?"}`);
+          layers.push(layer);
+        }
+      }
+      return layers.length > 0 ? layers : null;
+    }
+  } catch (e) {
+    console.error("[DEBUG] Error rendering building:", e);
+  }
+  return null;
+}
+
 async function loadAddress(id) {
   setStatus("Loading address details...");
   const res = await fetch(`/api/address/${id}`);
@@ -120,13 +171,71 @@ async function loadAddress(id) {
   clearMapObjects();
   detailsEl.classList.remove("hidden");
   detailsTitleEl.textContent = item.address_text;
-  detailsMetaEl.textContent = `${item.dataset_name} | ${item.source_table}#${item.source_fid}`;
+  const kadNr = item.parcel?.kadastro_nr;
+  const metaParts = [`${item.dataset_name} | ${item.source_table}#${item.source_fid}`];
+  if (kadNr) metaParts.push(`Kadastro nr.: ${kadNr}`);
+  detailsMetaEl.textContent = metaParts.join(" — ");
   detailsJsonEl.textContent = JSON.stringify(item.info, null, 2);
 
   const geometry = item.info && item.info._geometry;
   if (geometry) {
+    if (geometry.type === "Point") {
+      let parcelBounds = null;
+      if (item.parcel && item.parcel.geometry_json) {
+        try {
+          const parcelGeom = JSON.parse(item.parcel.geometry_json);
+          const normalizedParcel = normalizeGeometryToWgs84(parcelGeom);
+          if (normalizedParcel) {
+            parcelLayer = L.geoJSON(normalizedParcel, {
+              style: { color: "#1d4e6b", weight: 2, fillColor: "#3a7ca5", fillOpacity: 0.18 },
+            }).addTo(map);
+            parcelLayer.bindPopup(`Sklypas: ${item.parcel.kadastro_nr || item.parcel.unikalus_nr || ""}`);
+            const b = parcelLayer.getBounds();
+            if (b.isValid()) parcelBounds = b;
+          }
+        } catch (e) {
+          console.error("Error rendering parcel:", e);
+        }
+      }
+
+      if (item.buildings && Array.isArray(item.buildings)) {
+        for (const building of item.buildings) {
+          if (!building.geometry_json) continue;
+          try {
+            const buildingGeom = JSON.parse(building.geometry_json);
+            const normalizedBuilding = normalizeGeometryToWgs84(buildingGeom);
+            if (normalizedBuilding) {
+              const layers = renderBuilding(normalizedBuilding, building.gml_id, building.description, building.numberOfDwellings, "#5cb85c");
+              if (layers) {
+                if (Array.isArray(layers)) buildingLayers.push(...layers);
+                else buildingLayers.push(layers);
+              }
+            }
+          } catch (e) {
+            console.error("Error rendering building:", e);
+          }
+        }
+      }
+
+      marker = L.marker([item.latitude, item.longitude]).addTo(map);
+      marker.bindPopup(item.address_text).openPopup();
+
+      if (parcelBounds) {
+        map.fitBounds(parcelBounds.pad(0.2));
+      } else {
+        map.setView([item.latitude, item.longitude], 18);
+      }
+
+      const buildingCount = item.buildings?.length || 0;
+      const parcelNote = item.parcel ? ", su sklypu" : "";
+      setStatus(`Address loaded${buildingCount > 0 ? ` with ${buildingCount} buildings` : ""}${parcelNote}`);
+      return;
+    }
+
+    // For Polygon geometries (parcels)
     const normalized = normalizeGeometryToWgs84(geometry);
     if (normalized) {
+      console.log("[DEBUG] Rendering Polygon geometry");
       parcelLayer = L.geoJSON(normalized, {
         style: {
           color: "#1d4e6b",
@@ -137,9 +246,59 @@ async function loadAddress(id) {
       }).addTo(map);
 
       const bounds = parcelLayer.getBounds();
+
+      if (item.buildings && Array.isArray(item.buildings) && item.buildings.length > 0) {
+        console.log("[DEBUG] Found", item.buildings.length, "buildings for Polygon");
+        for (const building of item.buildings) {
+          if (building.geometry_json) {
+            try {
+              const buildingGeom = JSON.parse(building.geometry_json);
+              const normalizedBuilding = normalizeGeometryToWgs84(buildingGeom);
+              if (normalizedBuilding) {
+                let centerLat = 0, centerLon = 0, pointCount = 0;
+                const collectPoints = (coords) => {
+                  if (Array.isArray(coords[0])) {
+                    if (typeof coords[0][0] === "number") {
+                      centerLon += coords[0];
+                      centerLat += coords[1];
+                      pointCount++;
+                    } else {
+                      coords.forEach(collectPoints);
+                    }
+                  }
+                };
+                collectPoints(normalizedBuilding.coordinates);
+                const buildingCenter = pointCount > 0 
+                  ? L.latLng(centerLat / pointCount, centerLon / pointCount)
+                  : L.latLng(
+                      normalizedBuilding.coordinates?.[0]?.[0]?.[1] || 0,
+                      normalizedBuilding.coordinates?.[0]?.[0]?.[0] || 0
+                    );
+                
+                const isOutsideParcel = bounds.isValid() && !bounds.contains(buildingCenter);
+                const color = isOutsideParcel ? "#d9534f" : "#5cb85c";
+                console.log("[DEBUG] Building outside:", isOutsideParcel, "color:", color);
+                
+                const layers = renderBuilding(normalizedBuilding, building.gml_id, building.description, building.numberOfDwellings, color);
+                if (layers) {
+                  if (Array.isArray(layers)) {
+                    buildingLayers.push(...layers);
+                  } else {
+                    buildingLayers.push(layers);
+                  }
+                }
+              }
+            } catch (e) {
+              console.error("[DEBUG] Error rendering building:", e);
+            }
+          }
+        }
+      }
+
       if (bounds.isValid()) {
         map.fitBounds(bounds.pad(0.2));
-        setStatus("Address loaded");
+        const buildingCount = item.buildings?.length || 0;
+        setStatus(`Address loaded${buildingCount > 0 ? ` with ${buildingCount} buildings` : ""}`);
         return;
       }
     }
